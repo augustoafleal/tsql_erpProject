@@ -1,0 +1,306 @@
+﻿/* PROCEDURE PARA GERAR PEDIDOS DE COMPRAS */
+USE tsql_erpProject
+GO
+
+-- Ajustes iniciais em tabelas
+UPDATE MATERIAL SET ID_FOR = 1 WHERE COD_EMPRESA = 1 AND COD_MAT IN (9, 10);
+
+ALTER TABLE PED_COMPRAS_ITENS ALTER COLUMN QTD DECIMAL(10, 2);
+
+ALTER TABLE PED_VENDAS_ITENS ALTER COLUMN QTD DECIMAL(10, 2);
+
+-- Criação da procedure
+CREATE PROCEDURE PROC_GER_PED_COMPRAS
+	(@COD_EMPRESA INT,
+	@MES VARCHAR(2),
+	@ANO VARCHAR(4))
+AS
+BEGIN
+	-- Declaração de tabela temp para atribuir em output
+	DECLARE @PED_AUX TABLE
+		(
+		NUM_PEDIDO_AUX INT
+		)
+	DECLARE @RETORNO TABLE
+		(
+		RET_ORD INT,
+		RET_SIT VARCHAR(1)
+		)
+
+	-- Declaração de variáveis
+	DECLARE @COD_EMPRESA_AUX INT,
+			@MES_AUX VARCHAR(2),
+			@ANO_AUX VARCHAR(4),
+			@NUM_PEDIDO INT,
+			@ID_ORDEM INT,
+			@NUM_PEDIDO_AUX INT,
+			@COD_MAT INT,
+			@ID_FOR INT ,
+			@COD_PAGTO INT,
+			@DATA_PEDIDO DATE,
+			@DATA_ENTREGA DATE ,
+			@SITUACAO VARCHAR(1),
+			@QTD DECIMAL(10,2),
+			@PRECO_UNIT DECIMAL (10,2),
+			@CONT_SEQ INT,
+			@TOTAL_PED DECIMAL(10,2),
+			@ERRO_INTERNO INT
+
+	SET @TOTAL_PED = 0
+
+	-- Incia transação
+	BEGIN TRANSACTION
+
+	-- Begin try
+	BEGIN TRY
+
+		-- Condição para verificar pedidos do mês retroativo
+		IF (@mes = '1')
+			BEGIN
+		SET @MES_AUX = 12
+		SET @ANO_AUX = @ANO - 1
+	END
+		ELSE
+			BEGIN
+		SET @MES_AUX = @MES - 1
+		SET @ANO_AUX = @ANO
+	END
+		
+		-- Verifica se existem ordens de produção em aberto
+		SELECT A.COD_EMPRESA, A.ID_ORDEM
+		FROM ORDEM_PROD A
+		WHERE A.COD_EMPRESA = @COD_EMPRESA
+			AND MONTH(A.DATA_INI) = @MES
+			AND YEAR(A.DATA_INI) = @ANO
+			AND A.SITUACAO = 'A'
+
+			IF @@ROWCOUNT = 0
+				BEGIN
+			SET @ERRO_INTERNO = 1
+			END
+			ELSE
+				BEGIN
+
+				SET @CONT_SEQ = 1
+
+				/* 
+				Criação de cursor para gravar cabeçalho de pedido de compras (tabela PED_COMP)
+				com	select para gerar necessidades de compras conforme ordem de produção,
+				ficha técnica e produto com fornecedor 
+				*/
+
+				DECLARE PED_COMP CURSOR FOR
+
+					SELECT DISTINCT A.COD_EMPRESA,
+					C.ID_FOR,
+					D.COD_PAGTO,
+					CAST('15-'+@MES_AUX+'-'+@ANO_AUX AS DATE) AS DATA_PEDIDO,
+					CAST('15-'+@MES+'-'+@ANO AS DATE)  DATA_ENTREGA,
+					'A' SITUACAO
+					FROM ORDEM_PROD A
+					INNER JOIN FICHA_TECNICA B
+					ON A.COD_EMPRESA=B.COD_EMPRESA AND A.COD_MAT_PROD=B.COD_MAT_PROD
+					INNER JOIN MATERIAL C
+					ON A.COD_EMPRESA=C.COD_EMPRESA AND B.COD_MAT_NECES=C.COD_MAT
+					INNER JOIN FORNECEDORES D
+					ON A.COD_EMPRESA=D.COD_EMPRESA AND C.ID_FOR=D.ID_FOR
+					WHERE A.COD_EMPRESA=@COD_EMPRESA
+					AND MONTH(A.DATA_INI)=@MES
+					AND YEAR(A.DATA_INI)=@ANO
+					AND A.SITUACAO='A'
+
+			-- Abertura de cursor
+			OPEN PED_COMP
+
+			-- Seleciona próxima linha do cursor
+			FETCH NEXT 
+					FROM PED_COMP
+					INTO @COD_EMPRESA_AUX,@ID_FOR,@COD_PAGTO,@DATA_PEDIDO,@DATA_ENTREGA,@SITUACAO
+
+			WHILE @@FETCH_STATUS = 0
+						BEGIN
+				-- Seleciona número do pedido
+				PRINT 'Realizando update de parâmetros'
+				UPDATE PARAMETROS SET VALOR = VALOR + 1
+							OUTPUT INSERTED.VALOR INTO @PED_AUX
+							WHERE COD_EMPRESA = @COD_EMPRESA
+					AND PARAM = 'PED_COMPRAS';
+
+				-- Atribui valor do pedido 
+				SELECT @NUM_PEDIDO_AUX = NUM_PEDIDO_AUX
+				FROM @PED_AUX
+
+				-- Apresenta valores (para checagem)
+				SELECT @COD_EMPRESA COD_EMPRESA, @NUM_PEDIDO_AUX NUM_PEDIDO_AUX, @ID_FOR ID_FOR, @COD_PAGTO COD_PAGTO,
+					@DATA_PEDIDO DATA_PEDIDO, @DATA_ENTREGA DATA_ENTREGA, @SITUACAO SITUACAO;
+
+				-- Faz o INSERT na tabela PED_COMPRAS
+				INSERT INTO PED_COMPRAS
+					(COD_EMPRESA,NUM_PEDIDO,ID_FOR,COD_PAGTO,DATA_PEDIDO,DATA_ENTREGA,SITUACAO)
+				OUTPUT
+				'INFOR'
+				AS
+				MSG,INSERTED.COD_EMPRESA,INSERTED.NUM_PEDIDO
+				VALUES
+					(@COD_EMPRESA, @NUM_PEDIDO_AUX, @ID_FOR, @COD_PAGTO, @DATA_PEDIDO, @DATA_ENTREGA, @SITUACAO);
+
+				-- Cursor para atualizar detalhes do pedido
+				DECLARE PED_COMP_IT CURSOR FOR 
+							-- Realiza o select
+							SELECT A.COD_EMPRESA, B.COD_MAT_NECES COD_MAT, C.ID_FOR,
+					SUM(B.QTD_NECES * A.QTD_PLAN) AS QTD, C.PRECO_UNIT
+				FROM ORDEM_PROD A
+					INNER JOIN FICHA_TECNICA B
+					ON A.COD_EMPRESA=B.COD_EMPRESA AND A.COD_MAT_PROD=B.COD_MAT_PROD
+					INNER JOIN MATERIAL C
+					ON A.COD_EMPRESA=C.COD_EMPRESA AND B.COD_MAT_NECES=C.COD_MAT
+					INNER JOIN FORNECEDORES D
+					ON A.COD_EMPRESA=D.COD_EMPRESA AND C.ID_FOR=D.ID_FOR
+				WHERE A.COD_EMPRESA=@COD_EMPRESA
+					AND MONTH(A.DATA_INI)=@MES
+					AND YEAR(A.DATA_INI)=@ANO
+					AND A.SITUACAO='A'
+					AND C.ID_FOR=@ID_FOR
+				GROUP BY A.COD_EMPRESA,B.COD_MAT_NECES,C.ID_FOR,C.PRECO_UNIT
+
+				-- Abre o cursor
+				OPEN PED_COMP_IT
+
+				-- Lê o próximo registro
+				FETCH NEXT FROM PED_COMP_IT
+								INTO  @COD_EMPRESA,@COD_MAT,@ID_FOR,@QTD,@PRECO_UNIT
+
+				-- Inicia o laço while
+				WHILE @@FETCH_STATUS = 0
+									BEGIN
+					--VERIFICACOES PARA CONTADOR DE SEQ MATERIAL E TOTAL_PED
+					IF (@NUM_PEDIDO != @NUM_PEDIDO_AUX)
+									BEGIN
+						SET @CONT_SEQ=1;
+						SET @TOTAL_PED=0;
+					END
+					-- Insere registros na PED_COMPRAS_ITENS
+
+					INSERT INTO PED_COMPRAS_ITENS
+					VALUES
+						(@COD_EMPRESA, @NUM_PEDIDO_AUX, @CONT_SEQ, @COD_MAT, @QTD, @PRECO_UNIT);
+
+					-- Spresenta valores para checagem
+					SELECT @COD_EMPRESA AS COD_EMPRESA, @NUM_PEDIDO_AUX AS NUM_PEDIDO_AUX, @CONT_SEQ AS CONT_SEQ,
+						@COD_MAT AS COD_MAT, @QTD AS QTD, @PRECO_UNIT AS PRECO_UNIT;
+
+					-- Atribui valores
+					SET @NUM_PEDIDO = @NUM_PEDIDO_AUX;
+					-- Para não cair mais no if acima  IF (@NUM_PEDIDO != @NUM_PEDIDO_AUX)
+					SET @CONT_SEQ = @CONT_SEQ + 1;
+					SET @TOTAL_PED = @TOTAL_PED+(@QTD * @PRECO_UNIT);
+
+					-- Realiza a leitura da próxima linha do cursor
+					FETCH NEXT FROM PED_COMP_IT	   
+										INTO  @COD_EMPRESA,@COD_MAT,@ID_FOR,@QTD,@PRECO_UNIT
+
+				END
+
+				-- Fecha cursor interno e desaloca
+				CLOSE PED_COMP_IT
+				DEALLOCATE PED_COMP_IT
+
+				SELECT @NUM_PEDIDO AS PEDIDO, @TOTAL_PED AS TOTAL_PEDIDO
+				-- Atualiza o total do pedido após o cursor interno ter finalizado e calculado
+				UPDATE PED_COMPRAS SET TOTAL_PED=@TOTAL_PED
+								WHERE COD_EMPRESA = @COD_EMPRESA
+					AND NUM_PEDIDO = @NUM_PEDIDO;
+
+				-- Lê a próxima linha do cursor
+				FETCH NEXT FROM PED_COMP
+									INTO @COD_EMPRESA,@ID_FOR,@COD_PAGTO,@DATA_PEDIDO,@DATA_ENTREGA,@SITUACAO;
+				PRINT @NUM_PEDIDO_AUX;
+				SET @NUM_PEDIDO=@NUM_PEDIDO_AUX;
+
+			END
+
+			-- Fecha cursor externo e desaloca 
+			CLOSE PED_COMP
+			DEALLOCATE PED_COMP
+			END
+
+			-- Realiza as validações finais 
+			IF @@ERROR != 0 
+			BEGIN
+				ROLLBACK
+				PRINT 'OPERAÇÃO CANCELADA'
+			END
+			ELSE IF @ERRO_INTERNO = 1
+			BEGIN
+				ROLLBACK
+				PRINT 'NÃO EXISTEM ORDENS OU NENHUMA ESTÁ ABERTA'
+				END
+			ELSE
+				BEGIN
+
+				-- Atualiza o status da ordem para não gerar mais demandas de compras 
+				UPDATE  ORDEM_PROD SET SITUACAO='P'
+				OUTPUT INSERTED.ID_ORDEM, INSERTED.SITUACAO INTO @RETORNO
+				WHERE COD_EMPRESA = @COD_EMPRESA
+				AND MONTH(DATA_INI) = @MES
+				AND YEAR(DATA_INI) = @ANO
+				AND SITUACAO='A';
+
+				SELECT *
+				FROM @RETORNO
+
+				PRINT 'OPERAÇÃO FINALIZADA COM SUCESSO'
+				COMMIT TRANSACTION
+			END
+		END TRY
+		BEGIN CATCH
+			SELECT
+			ERROR_NUMBER() AS ErrorNumber,
+			ERROR_SEVERITY() AS ErrorSeverity ,
+			ERROR_STATE() AS ErrorState,
+			ERROR_PROCEDURE() AS ErrorProcedure ,
+			ERROR_LINE() AS ErrorLine,
+			ERROR_MESSAGE() AS ErrorMessage;  
+
+			-- Fecha cursores que tenham ficado aberto durante ocorrência do erro
+			IF (SELECT CURSOR_STATUS('global', 'PED_COMP')) = 1 
+				BEGIN
+					CLOSE PED_COMP
+					DEALLOCATE PED_COMP
+			END
+			IF (SELECT CURSOR_STATUS('global', 'PED_COMP_IT')) = 1 
+					BEGIN
+						CLOSE PED_COMP_IT
+						DEALLOCATE PED_COMP_IT
+			END	
+		
+			SET XACT_ABORT ON; -- Aborta a transação
+			-- Executa rollback na transação para evitar registros pela metade
+			IF @@TRANCOUNT > 0  
+			ROLLBACK TRANSACTION;  
+	 
+		END CATCH
+END
+
+-- Teste da procedure
+EXEC PROC_GER_PED_COMPRAS  @COD_EMPRESA=1, @MES=1, @ANO=2018
+
+-- Análise de resultados
+SELECT *
+FROM ORDEM_PROD
+SELECT *
+FROM PED_COMPRAS
+SELECT *
+FROM PED_COMPRAS_ITENS
+SELECT *
+FROM PARAMETROS
+
+--CONFERINDO TOTAL DO PEDIDO COM TOTAL DETALHES ITENS
+SELECT A.NUM_PEDIDO,
+	TOTAL_PED,
+	SUM(B.QTD*B.VAL_UNIT) AS TOT_ITENS
+FROM PED_COMPRAS A
+	INNER JOIN PED_COMPRAS_ITENS B 
+	ON A.COD_EMPRESA=B.COD_EMPRESA
+	AND A.NUM_PEDIDO=B.NUM_PEDIDO
+GROUP BY A.NUM_PEDIDO,TOTAL_PED 
